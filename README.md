@@ -1,95 +1,60 @@
 # NEXUS Trading System
 
-A comprehensive algorithmic trading system with ML-powered signals, backtesting, and a professional dark trading terminal UI.
+A comprehensive algorithmic trading system with ML-powered signals, backtesting, and a professional dark trading terminal UI. Now with **real-time data integration from Deriv API**!
 
-## Features
+![NEXUS Terminal](https://via.placeholder.com/800x400/0a0e1a/00ff88?text=NEXUS+Trading+Terminal)
+
+## 🚀 Features
 
 ### 🤖 Machine Learning Engine
-- **Ensemble model**: Random Forest + Gradient Boosting
-- **40+ features**: RSI, MACD, Bollinger Bands, ATR, Stochastic, Williams %R, CCI, ADX, OBV, Ichimoku, Donchian Channel, Keltner Channel, MFI, and more
+- **Ensemble model**: Random Forest + Gradient Boosting with meta-labeling
+- **40+ technical features**: RSI, MACD, Bollinger Bands, ATR, Stochastic, Williams %R, CCI, ADX, OBV, Ichimoku, Donchian Channel, Keltner Channel, MFI, and more
 - **Time-series cross-validation** with 5-fold split
-- **Confidence scoring** on all signals
-- **Label engineering**: Forward-looking returns with configurable threshold
+- **Confidence scoring** on all signals with probability calibration
+- **Label engineering**: Triple-barrier method with configurable thresholds
+- **Feature importance tracking** and model persistence
 
 ### 📊 Instruments
-- EUR/USD, GBP/USD, USD/JPY, AUD/USD, USD/CHF, USD/CAD, NZD/USD
-- XAU/USD (Gold)
+- Major Forex pairs: EUR/USD, GBP/USD, USD/JPY, AUD/USD, USD/CAD, NZD/USD, USD/CHF
+- Commodities: XAU/USD (Gold)
+- **Extensible** for any instrument with Deriv API support
+
+### 🔌 Real Data Integration
+- **Deriv API** for real historical and real-time data
+- Automatic fallback to synthetic data when API unavailable
+- WebSocket connection for live price updates
+- Multiple timeframe support (1m, 5m, 15m, 30m, 1h, 4h, 1d)
+- Intelligent caching to minimize API calls
+- Rate limiting and error handling
 
 ### 📈 Backtest Engine
 - Risk-based position sizing (% risk per trade)
 - ATR-based stop loss & take profit
 - Slippage and commission modeling
-- **Metrics**: Sharpe, Sortino, Max Drawdown, Calmar, Win Rate, Profit Factor, Expectancy
+- **Comprehensive metrics**: Sharpe, Sortino, Max Drawdown, Calmar, Win Rate, Profit Factor, Expectancy
 - Full equity curve and trade log
+- Walk-forward analysis support
+- Parameter optimization with grid search
 
 ### 🖥️ Frontend Dashboard
-- Live signal scanner with confidence bars
+- Live signal scanner with confidence bars and validation badges
 - Interactive charts: Price + EMA + Bollinger Bands, RSI, MACD, ADX
-- Backtest configuration and results
-- Model management & training status
-- CSV data upload
+- Backtest configuration and results visualization
+- Model management & training status with real-time updates
+- CSV data upload with validation
+- **Performance tracking** with win rate analysis by confidence level
+- Multi-timeframe signal validation
+- Real-time price display
 
-## Setup
+## 📋 Prerequisites
 
-### 1. Install dependencies
+- Python 3.8 or higher
+- pip package manager
+- (Optional) Deriv API token for real data - get one free at [app.deriv.com](https://app.deriv.com)
+
+## 🔧 Installation
+
+### 1. Clone the repository
 ```bash
-pip install -r requirements.txt
-```
-
-### 2. Run the server
-```bash
-cd trading_system
-python app.py
-```
-
-### 3. Open browser
-Navigate to: http://localhost:5000
-
-## Usage
-
-### Getting Signals
-1. The system generates rule-based signals immediately on startup
-2. Click **"TRAIN ALL"** to train ML models (takes 1-2 min)
-3. Click any signal card to see detailed analysis with entry/SL/TP levels
-
-### Uploading Your Data
-1. Go to **"DATA UPLOAD"** tab
-2. Select instrument and upload a CSV with columns: `date, open, high, low, close, volume`
-3. Go to **"MODELS"** tab and train the model for that instrument
-
-### Running a Backtest
-1. Go to **"BACKTEST"** tab
-2. Configure parameters (capital, risk %, confidence threshold)
-3. Click **"RUN BACKTEST"**
-4. Review equity curve and trade log
-
-### Chart Analysis
-1. Go to **"CHART ANALYSIS"** tab
-2. Select instrument and period
-3. View price chart with overlaid indicators, RSI, MACD, ADX panels
-
-## File Structure
-```
-trading_system/
-├── app.py              # Flask API server
-├── data_manager.py     # Data loading & synthetic generation
-├── indicators.py       # 20+ technical indicators
-├── ml_engine.py        # ML model training & signal generation
-├── backtester.py       # Backtesting engine
-├── requirements.txt    
-├── models/             # Saved trained models (auto-created)
-├── data/               # Uploaded CSV files (auto-created)
-└── templates/
-    └── index.html      # Frontend dashboard
-```
-
-## Adding New Instruments
-Edit `data_manager.py` and add to `INSTRUMENTS` dict:
-```python
-'BTCUSD': {'base_price': 45000.0, 'volatility': 500.0, 'trend': 0.0001, 'spread': 5.0},
-```
-
-## Notes
-- When no CSV data is uploaded, the system uses synthetic data (Geometric Brownian Motion with regime switching) to demonstrate functionality
-- For real trading, always upload real historical data before training
-- Signals are for educational purposes only — not financial advice
+git clone https://github.com/Obakeng007/Nexus.git
+cd Nexus/trading_system

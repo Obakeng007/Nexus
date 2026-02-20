@@ -1,419 +1,922 @@
 """
-ML Engine v2 — uses features.py for feature engineering & labeling
-- Ensemble: RandomForest + GradientBoosting
-- Labels come from create_labels() in features.py (ATR-directional, proven)
-- Signals are purely from model predictions, not rule-based
-- Model persistence with full metadata
+Enhanced Machine Learning Engine for NEXUS Trading System.
+Implements ensemble models with advanced features.
+FIXED: Using VotingClassifier instead of custom EnsembleModel for CalibratedClassifierCV compatibility.
+FIXED: Added NaN handling in labels to prevent training errors.
 """
-import os
-import pickle
-import warnings
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.preprocessing import RobustScaler
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import accuracy_score, classification_report
-from features import add_features, create_labels, FEATURE_COLS
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
+from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (accuracy_score, precision_score, recall_score, f1_score,
+                           roc_auc_score, confusion_matrix)
+from sklearn.calibration import CalibratedClassifierCV
+import joblib
+from typing import Dict, List, Optional, Tuple, Any
+import logging
+from datetime import datetime
+import warnings
+import os
 
-warnings.filterwarnings("ignore")
+# Import local modules
+import config
+from features import AdvancedFeatureEngine
+from label_generator import TripleBarrierLabeler
+from indicators import calculate_all_indicators, calculate_atr
 
-MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
-os.makedirs(MODELS_DIR, exist_ok=True)
+warnings.filterwarnings('ignore')
+logger = logging.getLogger(__name__)
 
-
-# ── Training ───────────────────────────────────────────────────────────────────
-def train_model(df: pd.DataFrame, pair: str,
-                forward_bars: int = 5,
-                atr_multiplier: float = 0.5) -> tuple[dict, dict]:
+class MLEngine:
     """
-    Train RF + GB ensemble on the supplied OHLCV dataframe.
-    Returns (model_data dict, metrics dict).
+    Enhanced machine learning engine for trading signals.
     """
-    print(f"  Training [{pair}]  rows={len(df)} …")
-
-    # Feature engineering + labeling
-    df_feat = add_features(df.copy())
-    df_feat = create_labels(df_feat, forward_bars=forward_bars, atr_multiplier=atr_multiplier)
-
-    # Feature matrix
-    avail   = [c for c in FEATURE_COLS if c in df_feat.columns]
-    X       = df_feat[avail].copy().replace([np.inf, -np.inf], np.nan)
-    y       = df_feat["label"]
-
-    # Drop rows where features or label are NaN (warm-up period)
-    mask = X.notna().all(axis=1) & y.notna()
-    X, y = X[mask], y[mask]
-
-    if len(X) < 200:
-        raise ValueError(f"Not enough clean rows after feature engineering: {len(X)}")
-
-    # Label distribution
-    uniq, cnts = np.unique(y, return_counts=True)
-    label_map  = {-1: "SELL", 0: "HOLD", 1: "BUY"}
-    class_dist = {label_map.get(int(k), str(k)): int(v) for k, v in zip(uniq, cnts)}
-    print(f"    Label distribution: {class_dist}")
-
-    # Time-series split (80 / 20)
-    split   = int(len(X) * 0.8)
-    X_tr, X_te = X.iloc[:split], X.iloc[split:]
-    y_tr, y_te = y.iloc[:split], y.iloc[split:]
-
-    scaler      = RobustScaler()
-    X_tr_s      = scaler.fit_transform(X_tr)
-    X_te_s      = scaler.transform(X_te)
-
-    # ── Random Forest ──
-    rf = RandomForestClassifier(
-        n_estimators=300, max_depth=8, min_samples_leaf=10,
-        min_samples_split=20, max_features="sqrt",
-        class_weight="balanced", n_jobs=-1, random_state=42,
-    )
-    rf.fit(X_tr_s, y_tr)
-
-    # ── Gradient Boosting ──
-    gb = GradientBoostingClassifier(
-        n_estimators=150, max_depth=4, learning_rate=0.04,
-        subsample=0.8, min_samples_split=20, random_state=42,
-    )
-    gb.fit(X_tr_s, y_tr)
-
-    # ── Ensemble predict on test set ──
-    rf_proba = rf.predict_proba(X_te_s)
-    gb_proba = gb.predict_proba(X_te_s)
-
-    # Align class arrays (both models may have different class ordering)
-    classes_rf = np.array(rf.classes_)
-    classes_gb = np.array(gb.classes_)
-
-    # Build combined probability matrix aligned to rf class order
-    combined = rf_proba.copy()
-    for i, cls in enumerate(classes_rf):
-        if cls in classes_gb:
-            j = list(classes_gb).index(cls)
-            combined[:, i] = (rf_proba[:, i] + gb_proba[:, j]) / 2
-
-    pred_idx    = np.argmax(combined, axis=1)
-    preds       = classes_rf[pred_idx]
-    accuracy    = accuracy_score(y_te, preds)
-
-    # ── CV score (5-fold time-series) ──
-    tscv     = TimeSeriesSplit(n_splits=5)
-    cv_scores = []
-    for tr_i, val_i in tscv.split(X_tr_s):
-        rf_cv = RandomForestClassifier(n_estimators=100, max_depth=6,
-                                       class_weight="balanced", n_jobs=-1, random_state=42)
-        rf_cv.fit(X_tr_s[tr_i], y_tr.iloc[tr_i])
-        cv_scores.append(accuracy_score(y_tr.iloc[val_i], rf_cv.predict(X_tr_s[val_i])))
-
-    # ── Feature importance ──
-    importance   = pd.Series(rf.feature_importances_, index=avail)
-    top_features = importance.nlargest(10).round(4).to_dict()
-
-    metrics = {
-        "accuracy":          round(float(accuracy), 4),
-        "cv_mean":           round(float(np.mean(cv_scores)), 4),
-        "cv_std":            round(float(np.std(cv_scores)), 4),
-        "train_samples":     int(len(X_tr)),
-        "test_samples":      int(len(X_te)),
-        "class_distribution": class_dist,
-        "top_features":      top_features,
-        "forward_bars":      forward_bars,
-        "atr_multiplier":    atr_multiplier,
-        "features_used":     len(avail),
-    }
-
-    print(f"    Accuracy={accuracy:.3f}  CV={np.mean(cv_scores):.3f}±{np.std(cv_scores):.3f}")
-
-    model_data = {
-        "rf": rf, "gb": gb, "scaler": scaler,
-        "feature_cols": avail,
-        "classes_rf": classes_rf.tolist(),
-        "classes_gb": classes_gb.tolist(),
-        "metrics": metrics,
-        "pair": pair,
-        "trained_at": pd.Timestamp.now("UTC").isoformat(),
-    }
-
-    path = os.path.join(MODELS_DIR, f"{pair}_model.pkl")
-    with open(path, "wb") as f:
-        pickle.dump(model_data, f)
-
-    return model_data, metrics
-
-
-# ── Load model ─────────────────────────────────────────────────────────────────
-def load_model(pair: str) -> dict | None:
-    path = os.path.join(MODELS_DIR, f"{pair}_model.pkl")
-    if not os.path.exists(path):
-        return None
-    with open(path, "rb") as f:
-        return pickle.load(f)
-
-
-# ── Signal generation ──────────────────────────────────────────────────────────
-def generate_signal(df: pd.DataFrame, pair: str,
-                    refine_with_m15: bool = True) -> dict:
-    """
-    Generate a live signal for the latest bar using the trained model.
-    Falls back to a rule-based signal only when no model exists.
-    If refine_with_m15=True, runs M15 entry refinement on BUY/SELL signals.
-    """
-    model_data = load_model(pair)
-    df_feat    = add_features(df.copy())
-
-    if model_data is None:
-        result = _rule_based_signal(df_feat, pair)
-    else:
-        result = _ml_signal(df_feat, model_data, pair)
-
-    # ── M15 entry refinement ─────────────────────────────────────────────────
-    if refine_with_m15 and result.get("signal") in ("BUY", "SELL"):
-        try:
-            from entry_refiner import get_m15_data, analyse_m15
-            df_m15 = get_m15_data(pair, 300)
-            m15    = analyse_m15(df_m15, result["signal"])
-            result["m15"] = m15
-
-            # If M15 gives a graded entry, override the entry/SL/TP
-            if m15.get("available") and m15.get("grade") in ("A", "B", "C") and m15.get("m15_entry"):
-                result["entry"]       = m15["m15_entry"]
-                result["stop_loss"]   = m15["m15_sl"]
-                result["take_profit"] = m15["m15_tp"]
-                result["rr_ratio"]    = m15["rr_ratio"]
-                result["entry_grade"] = m15["grade"]
-                result["entry_type"]  = "M15 refined"
+    
+    def __init__(self, config_dict: Dict[str, Any] = None):
+        """
+        Initialize ML engine.
+        
+        Args:
+            config_dict: Configuration dictionary
+        """
+        self.config = config_dict or config.ML_CONFIG
+        self.models = {}  # Trained models by instrument
+        self.scalers = {}  # Feature scalers by instrument
+        self.feature_importance = {}  # Feature importance by instrument
+        self.feature_cols = None  # Feature columns used
+        self.meta_models = {}  # Meta-models for validation
+        self.training_history = {}  # Training history by instrument
+        self.cv_scores = {}  # Cross-validation scores
+        
+        # Initialize components
+        self.feature_engine = AdvancedFeatureEngine(
+            lookback_periods=self.config['features']['lookback_periods']
+        )
+        self.labeler = TripleBarrierLabeler(config.LABEL_CONFIG['triple_barrier'])
+        
+        # Model parameters
+        self.model_params = self.config['ensemble']
+        self.cv_folds = self.config['training']['cv_folds']
+        self.confidence_threshold = self.config['training']['confidence_threshold']
+        self.min_samples = self.config['features']['min_samples']
+        
+    def prepare_features(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+        """
+        Prepare feature matrix for ML.
+        
+        Args:
+            df: DataFrame with OHLCV data
+        
+        Returns:
+            Tuple of (feature matrix, feature column names)
+        """
+        # Ensure all indicators are calculated
+        if not all(col in df.columns for col in ['rsi', 'macd', 'atr']):
+            df = calculate_all_indicators(df)
+        
+        # Calculate advanced features
+        df_with_features = self.feature_engine.calculate_all_features(df)
+        
+        # Select features (exclude price columns and NaN-heavy columns)
+        exclude_cols = ['open', 'high', 'low', 'close', 'volume', 'date', 
+                       'label', 'barrier_hit', 'hit_time', 'actual_return']
+        
+        # Get all numeric columns
+        numeric_cols = df_with_features.select_dtypes(include=[np.number]).columns
+        feature_cols = [c for c in numeric_cols 
+                       if c not in exclude_cols 
+                       and df_with_features[c].notna().sum() > len(df_with_features) * 0.5]
+        
+        # Fill remaining NaNs
+        X = df_with_features[feature_cols].copy()
+        X = X.fillna(method='ffill').fillna(method='bfill').fillna(0)
+        
+        # Remove infinite values
+        X = X.replace([np.inf, -np.inf], 0)
+        
+        self.feature_cols = feature_cols
+        
+        return X, feature_cols
+    
+    def train(self, 
+             instrument: str, 
+             df: pd.DataFrame,
+             optimize_hyperparams: bool = False,
+             save_model: bool = True) -> Dict[str, Any]:
+        """
+        Train model for a specific instrument.
+        
+        Args:
+            instrument: Instrument symbol
+            df: DataFrame with OHLCV data
+            optimize_hyperparams: Whether to optimize hyperparameters
+            save_model: Whether to save model to disk
+        
+        Returns:
+            Dictionary of training metrics
+        """
+        logger.info(f"Training model for {instrument}...")
+        
+        if len(df) < self.min_samples:
+            error_msg = f"Insufficient data: need {self.min_samples} samples, got {len(df)}"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+        
+        # Prepare features
+        X, feature_cols = self.prepare_features(df)
+        
+        # Calculate ATR for label generation
+        if 'atr' in df.columns:
+            atr = df['atr']
+        else:
+            atr = calculate_atr(df['high'], df['low'], df['close'])
+        
+        # Check data volatility and log it
+        avg_atr_pct = (atr / df['close']).mean()
+        logger.info(f"Average ATR %: {avg_atr_pct:.4%}")
+        
+        # Use index as timestamps if date column not present
+        timestamps = df.index if 'date' not in df.columns else pd.to_datetime(df['date'])
+        
+        # Generate labels using triple-barrier method
+        labels_df = self.labeler.get_triple_barrier_labels(
+            df['close'], 
+            timestamps,
+            atr
+        )
+        
+        # Use only valid labels (non-neutral)
+        valid_idx = labels_df['label'] != -1
+        X_filtered = X[valid_idx]
+        y = labels_df.loc[valid_idx, 'label']
+        
+        # Log label statistics
+        label_stats = self.labeler.get_label_statistics(labels_df)
+        logger.info(f"Label statistics: {label_stats}")
+        
+        # Check if we have enough valid samples
+        if len(X_filtered) < 100:
+            error_msg = f"Insufficient valid samples: {len(X_filtered)}"
+            logger.error(error_msg)
+            
+            # Try with even tighter barriers as fallback
+            if avg_atr_pct < 0.005:
+                logger.info("Attempting with ultra-tight barriers...")
+                # Save original barriers
+                original_upper = self.labeler.upper_barrier_pct
+                original_lower = self.labeler.lower_barrier_pct
+                
+                # Set ultra-tight barriers
+                self.labeler.upper_barrier_pct = 0.002  # 0.2%
+                self.labeler.lower_barrier_pct = 0.001  # 0.1%
+                
+                # Generate new labels
+                labels_df = self.labeler.get_triple_barrier_labels(
+                    df['close'], 
+                    timestamps,
+                    atr
+                )
+                
+                # Restore original barriers
+                self.labeler.upper_barrier_pct = original_upper
+                self.labeler.lower_barrier_pct = original_lower
+                
+                valid_idx = labels_df['label'] != -1
+                X_filtered = X[valid_idx]
+                y = labels_df.loc[valid_idx, 'label']
+                
+                if len(X_filtered) >= 100:
+                    logger.info(f"Ultra-tight barriers generated {len(X_filtered)} valid samples")
+            
+            if len(X_filtered) < 100:
+                raise ValueError(f"Insufficient valid samples: {len(X_filtered)}")
+        
+        X = X_filtered
+        logger.info(f"Training with {len(X)} samples, {len(feature_cols)} features")
+        logger.info(f"Class distribution: Wins={sum(y==1)}, Losses={sum(y==0)}")
+        
+        # Split data (time-series aware)
+        test_size = self.config['training']['test_size']
+        split_idx = int(len(X) * (1 - test_size))
+        
+        # Ensure no NaN values in X or y
+        logger.info("Cleaning data before split...")
+        X = X.fillna(0)
+        y = y.fillna(0).astype(int)  # Convert to int, fill NaN with 0
+        
+        # Double-check that y has no NaN
+        if y.isna().any():
+            logger.warning(f"Found NaN in y, filling with 0")
+            y = y.fillna(0)
+        
+        # Split the data
+        X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+        y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+        
+        # Verify no NaN in test data
+        if y_test.isna().any():
+            logger.warning(f"Found {y_test.isna().sum()} NaN in y_test, removing those samples")
+            # Find indices where y_test is not NaN
+            valid_test_idx = ~y_test.isna()
+            X_test = X_test[valid_test_idx]
+            y_test = y_test[valid_test_idx]
+        
+        if y_train.isna().any():
+            logger.warning(f"Found {y_train.isna().sum()} NaN in y_train, removing those samples")
+            valid_train_idx = ~y_train.isna()
+            X_train = X_train[valid_train_idx]
+            y_train = y_train[valid_train_idx]
+        
+        # Final check
+        if len(y_test) == 0:
+            raise ValueError("Test set is empty after removing NaNs. Try increasing test_size or checking data quality.")
+        
+        if len(y_train) == 0:
+            raise ValueError("Train set is empty after removing NaNs. Check your data.")
+        
+        logger.info(f"Train set size: {len(X_train)}, Test set size: {len(X_test)}")
+        logger.info(f"Train class distribution: Wins={sum(y_train==1)}, Losses={sum(y_train==0)}")
+        logger.info(f"Test class distribution: Wins={sum(y_test==1)}, Losses={sum(y_test==0)}")
+        
+        # Scale features
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+        
+        # Train ensemble
+        if optimize_hyperparams:
+            model = self._optimize_hyperparameters(X_train_scaled, y_train)
+        else:
+            # Random Forest
+            rf = RandomForestClassifier(
+                n_estimators=self.model_params['n_estimators'],
+                max_depth=self.model_params['max_depth'],
+                min_samples_split=self.model_params['min_samples_split'],
+                random_state=self.model_params['random_state'],
+                n_jobs=self.model_params['n_jobs'],
+                class_weight='balanced'
+            )
+            
+            # Gradient Boosting
+            gb = GradientBoostingClassifier(
+                n_estimators=50,
+                max_depth=3,
+                min_samples_split=50,
+                random_state=self.model_params['random_state'],
+                subsample=0.8
+            )
+            
+            # Train individual models
+            logger.info("Training Random Forest...")
+            rf.fit(X_train_scaled, y_train)
+            
+            logger.info("Training Gradient Boosting...")
+            gb.fit(X_train_scaled, y_train)
+            
+            # Create ensemble using VotingClassifier
+            from sklearn.ensemble import VotingClassifier
+            
+            logger.info("Creating ensemble model...")
+            model = VotingClassifier(
+                estimators=[
+                    ('rf', rf),
+                    ('gb', gb)
+                ],
+                voting='soft',
+                weights=[1, 1]
+            )
+            
+            model.fit(X_train_scaled, y_train)
+        
+        # Calibrate probabilities
+        logger.info("Calibrating probabilities...")
+        calibrated_model = CalibratedClassifierCV(
+            estimator=model,
+            cv=TimeSeriesSplit(n_splits=3),
+            method='sigmoid'
+        )
+        calibrated_model.fit(X_train_scaled, y_train)
+        
+        # Evaluate
+        y_pred = calibrated_model.predict(X_test_scaled)
+        y_pred_proba = calibrated_model.predict_proba(X_test_scaled)
+        
+        # Calculate metrics (with safety checks)
+        accuracy = accuracy_score(y_test, y_pred)
+        precision = precision_score(y_test, y_pred, average='weighted', zero_division=0)
+        recall = recall_score(y_test, y_pred, average='weighted', zero_division=0)
+        f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+        
+        # ROC AUC if binary classification
+        if len(np.unique(y)) == 2 and len(y_test) > 1:
+            try:
+                roc_auc = roc_auc_score(y_test, y_pred_proba[:, 1])
+            except:
+                roc_auc = 0.5
+        else:
+            roc_auc = 0.5
+        
+        # Confusion matrix
+        cm = confusion_matrix(y_test, y_pred)
+        
+        metrics = {
+            'accuracy': float(accuracy),
+            'precision': float(precision),
+            'recall': float(recall),
+            'f1': float(f1),
+            'roc_auc': float(roc_auc),
+            'confusion_matrix': cm.tolist(),
+            'train_size': int(len(X_train)),
+            'test_size': int(len(X_test)),
+            'feature_count': int(len(feature_cols)),
+            'class_distribution': {
+                'train_wins': int(sum(y_train==1)),
+                'train_losses': int(sum(y_train==0)),
+                'test_wins': int(sum(y_test==1)),
+                'test_losses': int(sum(y_test==0))
+            }
+        }
+        
+        # Cross-validation scores
+        cv_scores = self._cross_validate(X_train_scaled, y_train)
+        metrics['cv_scores'] = cv_scores
+        
+        # Store model and metadata
+        self.models[instrument] = calibrated_model
+        self.scalers[instrument] = scaler
+        
+        # Calculate feature importance (using RF from the voting classifier)
+        if hasattr(model, 'named_estimators_') and 'rf' in model.named_estimators_:
+            rf_model = model.named_estimators_['rf']
+            if hasattr(rf_model, 'feature_importances_'):
+                importance = pd.DataFrame({
+                    'feature': feature_cols,
+                    'importance': rf_model.feature_importances_
+                }).sort_values('importance', ascending=False)
+                self.feature_importance[instrument] = importance
+                metrics['top_features'] = importance.head(10).to_dict('records')
+        
+        # Store training history
+        self.training_history[instrument] = {
+            'timestamp': datetime.now(),
+            'metrics': metrics,
+            'samples': len(X),
+            'features': feature_cols
+        }
+        
+        logger.info(f"Training complete for {instrument}:")
+        logger.info(f"  Accuracy: {accuracy:.3f}")
+        logger.info(f"  Precision: {precision:.3f}")
+        logger.info(f"  Recall: {recall:.3f}")
+        logger.info(f"  F1 Score: {f1:.3f}")
+        logger.info(f"  ROC AUC: {roc_auc:.3f}")
+        
+        # Save model if requested
+        if save_model:
+            self.save_model(instrument)
+        
+        return metrics
+    
+    def _cross_validate(self, X: np.ndarray, y: np.ndarray) -> Dict[str, float]:
+        """
+        Perform time-series cross-validation.
+        
+        Args:
+            X: Feature matrix
+            y: Target labels
+        
+        Returns:
+            Dictionary of CV scores
+        """
+        tscv = TimeSeriesSplit(n_splits=self.cv_folds)
+        
+        cv_scores = {
+            'accuracy': [],
+            'precision': [],
+            'recall': [],
+            'f1': []
+        }
+        
+        for train_idx, val_idx in tscv.split(X):
+            X_train_fold, X_val_fold = X[train_idx], X[val_idx]
+            y_train_fold, y_val_fold = y[train_idx], y[val_idx]
+            
+            # Train simple model for CV
+            rf = RandomForestClassifier(
+                n_estimators=50,
+                max_depth=5,
+                random_state=42,
+                n_jobs=-1
+            )
+            rf.fit(X_train_fold, y_train_fold)
+            
+            # Predict
+            y_pred_fold = rf.predict(X_val_fold)
+            
+            # Calculate scores
+            cv_scores['accuracy'].append(accuracy_score(y_val_fold, y_pred_fold))
+            cv_scores['precision'].append(precision_score(y_val_fold, y_pred_fold, average='weighted', zero_division=0))
+            cv_scores['recall'].append(recall_score(y_val_fold, y_pred_fold, average='weighted', zero_division=0))
+            cv_scores['f1'].append(f1_score(y_val_fold, y_pred_fold, average='weighted', zero_division=0))
+        
+        # Calculate mean and std
+        cv_results = {}
+        for metric, scores in cv_scores.items():
+            cv_results[f'{metric}_mean'] = float(np.mean(scores))
+            cv_results[f'{metric}_std'] = float(np.std(scores))
+        
+        self.cv_scores = cv_results
+        
+        return cv_results
+    
+    def _optimize_hyperparameters(self, X, y) -> RandomForestClassifier:
+        """
+        Optimize hyperparameters using grid search.
+        
+        Args:
+            X: Feature matrix
+            y: Target labels
+        
+        Returns:
+            Optimized RandomForestClassifier
+        """
+        param_grid = {
+            'n_estimators': [50, 100, 200],
+            'max_depth': [5, 10, 15, None],
+            'min_samples_split': [20, 50, 100],
+            'min_samples_leaf': [10, 20, 50],
+            'max_features': ['sqrt', 'log2']
+        }
+        
+        tscv = TimeSeriesSplit(n_splits=3)
+        
+        grid_search = GridSearchCV(
+            RandomForestClassifier(random_state=42, n_jobs=-1, class_weight='balanced'),
+            param_grid,
+            cv=tscv,
+            scoring='f1_weighted',
+            n_jobs=-1,
+            verbose=0
+        )
+        
+        grid_search.fit(X, y)
+        
+        logger.info(f"Best parameters: {grid_search.best_params_}")
+        logger.info(f"Best CV score: {grid_search.best_score_:.3f}")
+        
+        return grid_search.best_estimator_
+    
+    def generate_signals(self, 
+                        instrument: str, 
+                        df: Optional[pd.DataFrame] = None,
+                        confidence_threshold: Optional[float] = None) -> List[Dict[str, Any]]:
+        """
+        Generate trading signals using trained model.
+        
+        Args:
+            instrument: Instrument symbol
+            df: Optional DataFrame with recent data
+            confidence_threshold: Override default confidence threshold
+        
+        Returns:
+            List of signal dictionaries
+        """
+        if confidence_threshold is None:
+            confidence_threshold = self.confidence_threshold
+        
+        if instrument not in self.models:
+            logger.warning(f"No model trained for {instrument}, using rule-based signals")
+            return self._generate_rule_based_signals(df)
+        
+        model = self.models[instrument]
+        scaler = self.scalers[instrument]
+        
+        if df is None:
+            from data_manager import DataManager
+            data_manager = DataManager()
+            df = data_manager.get_data(instrument)
+        
+        # Prepare features
+        X, _ = self.prepare_features(df)
+        
+        if len(X) == 0:
+            return []
+        
+        # Use recent data for signals (last 100 bars)
+        recent_X = X.iloc[-100:]
+        
+        # Scale and predict
+        X_scaled = scaler.transform(recent_X)
+        proba = model.predict_proba(X_scaled)
+        
+        # Generate signals
+        signals = []
+        
+        for i in range(len(proba)):
+            # Get probability of win (class 1)
+            if proba.shape[1] > 1:
+                win_probability = proba[i, 1]
+                loss_probability = proba[i, 0]
             else:
-                result["entry_grade"] = "H1"
-                result["entry_type"]  = "H1 only"
-                if m15.get("grade") == "W":
-                    result["entry_type"] = "Wait for M15 setup"
-        except Exception as e:
-            result["m15"] = {"available": False, "error": str(e)}
-            result["entry_grade"] = "H1"
-            result["entry_type"]  = "H1 only"
-    else:
-        result["entry_grade"] = "H1"
-        result["entry_type"]  = "H1 only"
-        result["m15"] = {"available": False, "direction": result.get("signal", "HOLD")}
-
-    return result
-
-
-def _ml_signal(df_feat: pd.DataFrame, model_data: dict, pair: str) -> dict:
-    """Derive signal from ML ensemble on the latest bar."""
-    rf          = model_data["rf"]
-    gb          = model_data["gb"]
-    scaler      = model_data["scaler"]
-    feat_cols   = model_data["feature_cols"]
-    classes_rf  = np.array(model_data["classes_rf"])
-    classes_gb  = np.array(model_data["classes_gb"])
-
-    X = df_feat[feat_cols].copy().replace([np.inf, -np.inf], np.nan)
-    X = X.dropna()
-    if X.empty:
-        return _rule_based_signal(df_feat, pair)
-
-    last       = X.iloc[[-1]]
-    last_s     = scaler.transform(last)
-
-    rf_proba   = rf.predict_proba(last_s)[0]
-    gb_proba   = gb.predict_proba(last_s)[0]
-
-    # Align to rf class order
-    combined = rf_proba.copy()
-    for i, cls in enumerate(classes_rf):
-        if cls in classes_gb:
-            j = list(classes_gb).index(cls)
-            combined[i] = (rf_proba[i] + gb_proba[j]) / 2
-
-    pred_idx    = int(np.argmax(combined))
-    pred_class  = int(classes_rf[pred_idx])
-    confidence  = float(combined[pred_idx]) * 100
-
-    label_map   = {1: "BUY", -1: "SELL", 0: "HOLD"}
-    signal_text = label_map.get(pred_class, "HOLD")
-
-    # Probability breakdown
-    proba_dict  = {}
-    for i, cls in enumerate(classes_rf):
-        proba_dict[label_map.get(int(cls), str(cls))] = round(float(combined[i]) * 100, 1)
-
-    # Make sure BUY/SELL/HOLD keys always present
-    for k in ["BUY", "HOLD", "SELL"]:
-        proba_dict.setdefault(k, 0.0)
-
-    return _build_output(df_feat, pair, signal_text, confidence, proba_dict, model_data)
-
-
-def _rule_based_signal(df_feat: pd.DataFrame, pair: str) -> dict:
-    """Simple indicator-consensus fallback when no model is trained."""
-    latest  = df_feat.dropna(subset=["rsi_14"]).iloc[-1] if not df_feat.empty else None
-    if latest is None:
-        return _empty_signal(pair)
-
-    score = 0
-    reasons = []
-
-    rsi = float(latest.get("rsi_14", 50))
-    if rsi < 35:
-        score += 2; reasons.append(f"RSI oversold ({rsi:.1f})")
-    elif rsi > 65:
-        score -= 2; reasons.append(f"RSI overbought ({rsi:.1f})")
-
-    if float(latest.get("macd_hist", 0)) > 0:
-        score += 1; reasons.append("MACD histogram positive")
-    else:
-        score -= 1; reasons.append("MACD histogram negative")
-
-    if int(latest.get("ema_cross", 0)) == 1:
-        score += 1; reasons.append("EMA 10 > EMA 20 (bullish)")
-    else:
-        score -= 1; reasons.append("EMA 10 < EMA 20 (bearish)")
-
-    stoch_k = float(latest.get("stoch_k", 50))
-    if stoch_k < 20:
-        score += 1; reasons.append(f"Stoch oversold ({stoch_k:.1f})")
-    elif stoch_k > 80:
-        score -= 1; reasons.append(f"Stoch overbought ({stoch_k:.1f})")
-
-    if score >= 2:
-        signal, conf = "BUY",  min(45 + score * 8, 72)
-    elif score <= -2:
-        signal, conf = "SELL", min(45 + abs(score) * 8, 72)
-    else:
-        signal, conf = "HOLD", 38
-
-    proba = {"BUY": 33, "HOLD": 34, "SELL": 33}
-
-    result = _build_output(df_feat, pair, signal, conf, proba, None)
-    result["note"] = "Rule-based fallback (model not trained)"
-    return result
-
-
-def _build_output(df_feat: pd.DataFrame, pair: str, signal: str,
-                  confidence: float, proba: dict,
-                  model_data: dict | None) -> dict:
-    """Build the full signal output dict with SL/TP levels."""
-    from data_manager import INSTRUMENTS
-
-    latest       = df_feat.iloc[-1]
-    current      = float(latest["close"])
-    atr_val      = float(latest.get("atr_14", current * 0.001))
-    cfg          = INSTRUMENTS.get(pair, {})
-    spread       = cfg.get("spread", current * 0.0001)
-    digits       = cfg.get("digits", 5)
-
-    if signal == "BUY":
-        entry = round(current + spread, digits)
-        sl    = round(entry - 2.0 * atr_val, digits)
-        tp    = round(entry + 3.0 * atr_val, digits)
-    elif signal == "SELL":
-        entry = round(current - spread, digits)
-        sl    = round(entry + 2.0 * atr_val, digits)
-        tp    = round(entry - 3.0 * atr_val, digits)
-    else:
-        entry = sl = tp = None
-
-    # Support / Resistance
-    hi20 = float(df_feat["high"].rolling(20).max().iloc[-1])
-    lo20 = float(df_feat["low"].rolling(20).min().iloc[-1])
-
-    # Reasons from indicator state
-    reasons = []
-    rsi_v   = float(latest.get("rsi_14", 50))
-    reasons.append(f"RSI-14: {rsi_v:.1f}" + (" (oversold)" if rsi_v < 35 else " (overbought)" if rsi_v > 65 else ""))
-    macd_h = float(latest.get("macd_hist", 0))
-    reasons.append(f"MACD hist: {'↑ positive' if macd_h > 0 else '↓ negative'}")
-    stk = float(latest.get("stoch_k", 50))
-    reasons.append(f"Stoch %K: {stk:.1f}" + (" (OB)" if stk > 80 else " (OS)" if stk < 20 else ""))
-    vr = int(latest.get("volatility_regime", 0))
-    reasons.append("High volatility regime" if vr == 1 else "Low volatility regime")
-    if int(latest.get("is_overlap", 0)):
-        reasons.append("London/NY overlap (high liquidity)")
-    elif int(latest.get("is_london", 0)):
-        reasons.append("London session active")
-    elif int(latest.get("is_newyork", 0)):
-        reasons.append("New York session active")
-
-    indicators = {
-        "rsi":       round(rsi_v, 2),
-        "rsi_7":     round(float(latest.get("rsi_7", 50)), 2),
-        "macd_hist": round(float(latest.get("macd_hist", 0)), 5),
-        "stoch_k":   round(stk, 2),
-        "stoch_d":   round(float(latest.get("stoch_d", 50)), 2),
-        "bb_pos":    round(float(latest.get("bb_pos", 0.5)), 3),
-        "bb_squeeze": int(latest.get("bb_squeeze", 0)),
-        "atr_ratio": round(float(latest.get("atr_ratio", 1)), 3),
-        "ema_cross": int(latest.get("ema_cross", 0)),
-        "trend_str": round(float(latest.get("trend_strength", 0)), 4),
-        "vol_regime": int(latest.get("volatility_regime", 0)),
-        "hl_pos":    round(float(latest.get("hl_position", 0.5)), 3),
-    }
-
-    return {
-        "pair":          pair,
-        "instrument":    pair,  # backward compat
-        "signal":        signal,
-        "confidence":    round(confidence, 1),
-        "probabilities": proba,
-        "current_price": round(current, digits),
-        "entry":         round(entry, digits) if entry else None,
-        "stop_loss":     round(sl, digits)    if sl    else None,
-        "take_profit":   round(tp, digits)    if tp    else None,
-        "rr_ratio":      1.5,
-        "atr":           round(atr_val, digits),
-        "reasons":       reasons[:5],
-        "indicators":    indicators,
-        "levels": {
-            "resistance": round(hi20, digits),
-            "support":    round(lo20, digits),
-        },
-        "timestamp":       str(df_feat.iloc[-1].get("datetime", "")) if "datetime" in df_feat.columns
-                           else str(pd.Timestamp.now("UTC")),
-        "model_accuracy":  round(model_data["metrics"]["accuracy"] * 100, 1) if model_data else None,
-        "model_trained":   model_data is not None,
-    }
-
-
-def _empty_signal(pair: str) -> dict:
-    return {
-        "pair": pair, "instrument": pair,
-        "signal": "HOLD", "confidence": 0,
-        "probabilities": {"BUY": 33, "HOLD": 34, "SELL": 33},
-        "current_price": 0, "entry": None, "stop_loss": None, "take_profit": None,
-        "reasons": ["Insufficient data"], "indicators": {}, "levels": {},
-        "model_accuracy": None, "model_trained": False, "timestamp": "",
-    }
-
-
-# ── Batch signals for all bars (used by backtester) ────────────────────────────
-def generate_signals_series(df_feat: pd.DataFrame, model_data: dict,
-                             confidence_threshold: float = 55.0) -> pd.Series:
-    """Return a Series of predicted labels (-1,0,1) for every bar."""
-    rf          = model_data["rf"]
-    gb          = model_data["gb"]
-    scaler      = model_data["scaler"]
-    feat_cols   = model_data["feature_cols"]
-    classes_rf  = np.array(model_data["classes_rf"])
-    classes_gb  = np.array(model_data["classes_gb"])
-
-    X = df_feat[feat_cols].copy().replace([np.inf, -np.inf], np.nan).fillna(0)
-    X_s = scaler.transform(X)
-
-    rf_proba = rf.predict_proba(X_s)
-    gb_proba = gb.predict_proba(X_s)
-
-    combined = rf_proba.copy()
-    for i, cls in enumerate(classes_rf):
-        if cls in classes_gb:
-            j = list(classes_gb).index(cls)
-            combined[:, i] = (rf_proba[:, i] + gb_proba[:, j]) / 2
-
-    pred_idx    = np.argmax(combined, axis=1)
-    preds       = classes_rf[pred_idx]
-    confidences = combined[np.arange(len(combined)), pred_idx] * 100
-
-    # Apply confidence threshold
-    signals = np.where(confidences >= confidence_threshold, preds, 0)
-    return pd.Series(signals.astype(int), index=df_feat.index)
+                win_probability = proba[i, 0]
+                loss_probability = 1 - win_probability
+            
+            # Get corresponding price data
+            data_idx = -100 + i
+            current_price = float(df['close'].iloc[data_idx])
+            current_atr = float(df['atr'].iloc[data_idx]) if 'atr' in df.columns else current_price * 0.01
+            
+            # Get timestamp
+            timestamp = df.index[data_idx]
+            if hasattr(timestamp, 'isoformat'):
+                timestamp_str = timestamp.isoformat()
+            else:
+                timestamp_str = str(timestamp)
+            
+            # Generate buy signal
+            if win_probability > confidence_threshold:
+                signal = {
+                    'direction': 1,
+                    'confidence': float(win_probability),
+                    'entry': float(current_price),
+                    'stop_loss': float(current_price - (current_atr * 1.5)),
+                    'take_profit': float(current_price + (current_atr * 3.0)),
+                    'timestamp': timestamp_str,
+                    'instrument': str(instrument),
+                    'signal_type': 'ML_BUY',
+                    'risk_reward': 2.0
+                }
+                signals.append(signal)
+            
+            # Generate sell signal
+            elif loss_probability > confidence_threshold:
+                signal = {
+                    'direction': -1,
+                    'confidence': float(loss_probability),
+                    'entry': float(current_price),
+                    'stop_loss': float(current_price + (current_atr * 1.5)),
+                    'take_profit': float(current_price - (current_atr * 3.0)),
+                    'timestamp': timestamp_str,
+                    'instrument': str(instrument),
+                    'signal_type': 'ML_SELL',
+                    'risk_reward': 2.0
+                }
+                signals.append(signal)
+        
+        # Sort by confidence and return most recent
+        signals.sort(key=lambda x: x['confidence'], reverse=True)
+        
+        # Add meta-model validation if available
+        if instrument in self.meta_models:
+            meta_model = self.meta_models[instrument]
+            filtered_signals = []
+            
+            for signal in signals:
+                success_prob, meta_confidence = meta_model.predict_signal_quality(df, signal)
+                if success_prob > 0.5:
+                    signal['meta_probability'] = float(success_prob)
+                    signal['meta_confidence'] = float(meta_confidence)
+                    signal['confidence'] = float((signal.get('confidence', 0.5) + success_prob) / 2)
+                    filtered_signals.append(signal)
+            
+            signals = filtered_signals
+        
+        return signals[-10:]  # Return most recent 10 signals
+    
+    def generate_signals_for_period(self,
+                                   instrument: str,
+                                   df: pd.DataFrame,
+                                   confidence_threshold: float = 0.5) -> List[Dict[str, Any]]:
+        """
+        Generate signals for entire backtest period.
+        
+        Args:
+            instrument: Instrument symbol
+            df: DataFrame with historical data
+            confidence_threshold: Confidence threshold
+        
+        Returns:
+            List of signals for the entire period
+        """
+        if instrument not in self.models:
+            return self._generate_rule_based_signals(df)
+        
+        model = self.models[instrument]
+        scaler = self.scalers[instrument]
+        
+        # Prepare features
+        X, _ = self.prepare_features(df)
+        
+        if len(X) < 100:
+            return []
+        
+        # Scale all data
+        X_scaled = scaler.transform(X)
+        
+        # Predict probabilities
+        proba = model.predict_proba(X_scaled)
+        
+        # Generate signals
+        signals = []
+        
+        for i in range(100, len(proba) - 1):  # Skip first 100 bars for feature calculation
+            if proba.shape[1] > 1:
+                win_probability = proba[i, 1]
+                loss_probability = proba[i, 0]
+            else:
+                win_probability = proba[i, 0]
+                loss_probability = 1 - win_probability
+            
+            current_price = float(df['close'].iloc[i])
+            current_atr = float(df['atr'].iloc[i]) if 'atr' in df.columns else current_price * 0.01
+            
+            # Get timestamp
+            timestamp = df.index[i]
+            if hasattr(timestamp, 'isoformat'):
+                timestamp_str = timestamp.isoformat()
+            else:
+                timestamp_str = str(timestamp)
+            
+            if win_probability > confidence_threshold:
+                signal = {
+                    'direction': 1,
+                    'confidence': float(win_probability),
+                    'entry': float(current_price),
+                    'stop_loss': float(current_price - (current_atr * 1.5)),
+                    'take_profit': float(current_price + (current_atr * 3.0)),
+                    'timestamp': timestamp_str,
+                    'instrument': instrument,
+                    'signal_type': 'ML_BUY'
+                }
+                signals.append(signal)
+            elif loss_probability > confidence_threshold:
+                signal = {
+                    'direction': -1,
+                    'confidence': float(loss_probability),
+                    'entry': float(current_price),
+                    'stop_loss': float(current_price + (current_atr * 1.5)),
+                    'take_profit': float(current_price - (current_atr * 3.0)),
+                    'timestamp': timestamp_str,
+                    'instrument': instrument,
+                    'signal_type': 'ML_SELL'
+                }
+                signals.append(signal)
+        
+        logger.info(f"Generated {len(signals)} signals for {instrument}")
+        
+        return signals
+    
+    def _generate_rule_based_signals(self, df: Optional[pd.DataFrame] = None) -> List[Dict[str, Any]]:
+        """
+        Generate rule-based signals when ML model is not available.
+        
+        Args:
+            df: DataFrame with OHLCV data
+        
+        Returns:
+            List of rule-based signals
+        """
+        if df is None or len(df) < 50:
+            return []
+        
+        from indicators import calculate_rsi, calculate_macd, calculate_bollinger_bands
+        
+        signals = []
+        
+        # Calculate indicators
+        rsi = calculate_rsi(df['close'], 14)
+        macd, signal_line, hist = calculate_macd(df['close'])
+        bb_upper, bb_middle, bb_lower = calculate_bollinger_bands(df['close'], 20)
+        
+        # Get latest values
+        current_price = float(df['close'].iloc[-1])
+        current_atr = float(df['atr'].iloc[-1]) if 'atr' in df.columns else current_price * 0.01
+        
+        # Get timestamp
+        timestamp = df.index[-1]
+        if hasattr(timestamp, 'isoformat'):
+            timestamp_str = timestamp.isoformat()
+        else:
+            timestamp_str = str(timestamp)
+        
+        # RSI oversold bounce
+        if rsi.iloc[-1] < 30 and rsi.iloc[-2] < rsi.iloc[-1]:
+            signals.append({
+                'direction': 1,
+                'confidence': 0.65,
+                'entry': float(current_price),
+                'stop_loss': float(current_price * 0.985),
+                'take_profit': float(current_price * 1.03),
+                'timestamp': timestamp_str,
+                'instrument': 'unknown',
+                'signal_type': 'RSI_OVERSOLD'
+            })
+        
+        # RSI overbought reversal
+        elif rsi.iloc[-1] > 70 and rsi.iloc[-2] > rsi.iloc[-1]:
+            signals.append({
+                'direction': -1,
+                'confidence': 0.65,
+                'entry': float(current_price),
+                'stop_loss': float(current_price * 1.015),
+                'take_profit': float(current_price * 0.97),
+                'timestamp': timestamp_str,
+                'instrument': 'unknown',
+                'signal_type': 'RSI_OVERBOUGHT'
+            })
+        
+        # MACD crossover
+        if macd.iloc[-1] > signal_line.iloc[-1] and macd.iloc[-2] <= signal_line.iloc[-2]:
+            signals.append({
+                'direction': 1,
+                'confidence': 0.6,
+                'entry': float(current_price),
+                'stop_loss': float(current_price * 0.99),
+                'take_profit': float(current_price * 1.02),
+                'timestamp': timestamp_str,
+                'instrument': 'unknown',
+                'signal_type': 'MACD_CROSS'
+            })
+        
+        # Bollinger Band squeeze
+        bb_width = (bb_upper - bb_lower) / bb_middle
+        if bb_width.iloc[-1] < bb_width.iloc[-20:].quantile(0.2):
+            # Squeeze - prepare for breakout
+            if df['close'].iloc[-1] > bb_middle.iloc[-1]:
+                signals.append({
+                    'direction': 1,
+                    'confidence': 0.55,
+                    'entry': float(current_price),
+                    'stop_loss': float(current_price - current_atr),
+                    'take_profit': float(current_price + current_atr * 2),
+                    'timestamp': timestamp_str,
+                    'signal_type': 'BB_SQUEEZE'
+                })
+        
+        return signals[-5:]  # Return most recent 5 signals
+    
+    def predict_proba(self, instrument: str, X: np.ndarray) -> np.ndarray:
+        """
+        Predict probabilities for features.
+        
+        Args:
+            instrument: Instrument symbol
+            X: Feature matrix
+        
+        Returns:
+            Probability predictions
+        """
+        if instrument not in self.models:
+            raise ValueError(f"No model trained for {instrument}")
+        
+        model = self.models[instrument]
+        scaler = self.scalers[instrument]
+        
+        X_scaled = scaler.transform(X)
+        return model.predict_proba(X_scaled)
+    
+    def save_model(self, instrument: str, path: Optional[str] = None) -> str:
+        """
+        Save trained model to disk.
+        
+        Args:
+            instrument: Instrument symbol
+            path: Optional file path
+        
+        Returns:
+            Path where model was saved
+        """
+        if instrument not in self.models:
+            raise ValueError(f"No model for {instrument}")
+        
+        if path is None:
+            filename = f"{instrument.replace('/', '_')}_model_{datetime.now().strftime('%Y%m%d')}.pkl"
+            path = config.MODELS_DIR / filename
+        
+        model_data = {
+            'model': self.models[instrument],
+            'scaler': self.scalers[instrument],
+            'feature_cols': self.feature_cols,
+            'feature_importance': self.feature_importance.get(instrument),
+            'training_history': self.training_history.get(instrument),
+            'cv_scores': self.cv_scores,
+            'config': self.config,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        joblib.dump(model_data, path)
+        logger.info(f"Model saved for {instrument} at {path}")
+        
+        return str(path)
+    
+    def load_model(self, instrument: str, path: Optional[str] = None) -> bool:
+        """
+        Load trained model from disk.
+        
+        Args:
+            instrument: Instrument symbol
+            path: Optional file path
+        
+        Returns:
+            True if successful
+        """
+        if path is None:
+            # Look for most recent model file
+            pattern = f"{instrument.replace('/', '_')}_model_*.pkl"
+            model_files = list(config.MODELS_DIR.glob(pattern))
+            
+            if not model_files:
+                raise FileNotFoundError(f"No model found for {instrument}")
+            
+            # Get most recent
+            path = max(model_files, key=lambda x: x.stat().st_mtime)
+        
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"No model found at {path}")
+        
+        model_data = joblib.load(path)
+        
+        self.models[instrument] = model_data['model']
+        self.scalers[instrument] = model_data['scaler']
+        self.feature_cols = model_data.get('feature_cols')
+        self.feature_importance[instrument] = model_data.get('feature_importance')
+        self.training_history[instrument] = model_data.get('training_history')
+        self.cv_scores = model_data.get('cv_scores', {})
+        
+        logger.info(f"Model loaded for {instrument} from {path}")
+        
+        return True
+    
+    def get_model_info(self, instrument: str) -> Dict[str, Any]:
+        """
+        Get information about trained model.
+        
+        Args:
+            instrument: Instrument symbol
+        
+        Returns:
+            Dictionary of model information
+        """
+        if instrument not in self.models:
+            return {'error': f'No model trained for {instrument}'}
+        
+        info = {
+            'instrument': instrument,
+            'trained': True,
+            'training_history': self.training_history.get(instrument, {}),
+            'feature_count': len(self.feature_cols) if self.feature_cols else 0,
+            'cv_scores': self.cv_scores
+        }
+        
+        if instrument in self.feature_importance:
+            info['top_features'] = self.feature_importance[instrument].head(10).to_dict('records')
+        
+        return info
+    
+    def check_label_quality(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """
+        Check label quality before training.
+        
+        Args:
+            df: DataFrame with OHLCV data
+        
+        Returns:
+            Dictionary with label statistics
+        """
+        # Calculate ATR if not present
+        if 'atr' not in df.columns:
+            atr = calculate_atr(df['high'], df['low'], df['close'])
+        else:
+            atr = df['atr']
+        
+        # Generate labels
+        labels_df = self.labeler.get_triple_barrier_labels(
+            df['close'], 
+            df.index,
+            atr
+        )
+        
+        # Get statistics
+        valid_labels = labels_df[labels_df['label'] != -1]
+        win_count = len(valid_labels[valid_labels['label'] == 1])
+        loss_count = len(valid_labels[valid_labels['label'] == 0])
+        neutral_count = len(labels_df[labels_df['label'] == -1])
+        
+        # Calculate average volatility
+        avg_atr_pct = (atr / df['close']).mean()
+        
+        stats = {
+            'total_samples': len(labels_df),
+            'win_count': int(win_count),
+            'loss_count': int(loss_count),
+            'neutral_count': int(neutral_count),
+            'win_rate': float(win_count / (win_count + loss_count)) if (win_count + loss_count) > 0 else 0,
+            'avg_atr_pct': float(avg_atr_pct),
+            'avg_holding_period': float(valid_labels['holding_periods'].mean()) if len(valid_labels) > 0 else 0,
+            'avg_return': float(valid_labels['actual_return'].mean()) if len(valid_labels) > 0 else 0
+        }
+        
+        logger.info(f"Label quality check: {stats}")
+        
+        return stats
