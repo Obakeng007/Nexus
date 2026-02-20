@@ -1,0 +1,54 @@
+{
+  "EURUSD_H1": {
+    "status": "ok",
+    "rows": 3448,
+    "source": "deriv",
+    "last": "2026-02-20 07:00:00",
+    "refreshed_at": "2026-02-20T07:08:41.805412"
+  },
+  "GBPUSD_H1": {
+    "status": "ok",
+    "rows": 3448,
+    "source": "deriv",
+    "last": "2026-02-20 07:00:00",
+    "refreshed_at": "2026-02-20T07:09:31.150128"
+  },
+  "USDJPY_H1": {
+    "status": "ok",
+    "rows": 3448,
+    "source": "deriv",
+    "last": "2026-02-20 07:00:00",
+    "refreshed_at": "2026-02-20T07:10:44.034865"
+  },
+  "AUDUSD_H1": {
+    "status": "ok",
+    "rows": 3447,
+    "source": "deriv",
+    "last": "2026-02-20 07:00:00",
+    "refreshed_at": "2026-02-20T07:11:33.144577"
+  },
+  "USDCAD_H1": {
+    "status": "ok",
+    "rows": 3448,
+    "source": "deriv",
+    "last": "2026-02-20 07:00:00",
+    "refreshed_at": "2026-02-20T07:12:29.682052"
+  },
+  "USDCHF_H1": {
+    "status": "fetch_failed"
+  },
+  "NZDUSD_H1": {
+    "status": "ok",
+    "rows": 3448,
+    "source": "deriv",
+    "last": "2026-02-20 07:00:00",
+    "refreshed_at": "2026-02-20T07:13:35.472127"
+  },
+  "XAUUSD_H1": {
+    "status": "ok",
+    "rows": 3286,
+    "source": "deriv",
+    "last": "2026-02-20 07:00:00",
+    "refreshed_at": "2026-02-20T07:14:18.020297"
+  }
+}
